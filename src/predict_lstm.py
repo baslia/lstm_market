@@ -23,6 +23,13 @@ import yfinance as yf
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.model_selection import train_test_split
 
+# Silence matplotlib debug logs (font discovery) early, before importing matplotlib
+try:
+    logging.getLogger('matplotlib.font_manager').setLevel(logging.WARNING)
+    logging.getLogger('matplotlib').setLevel(logging.WARNING)
+except Exception:
+    pass
+
 # optional plotting
 try:
     import matplotlib.pyplot as plt
@@ -99,9 +106,43 @@ def create_sequences(values: np.ndarray, seq_len: int):
     return np.array(X), np.array(y)
 
 
+def _normalize_input_shape(input_shape):
+    """Return a shape tuple (without batch dim) from various input_shape representations.
+
+    Accepts:
+    - tuple/list of ints
+    - a KerasTensor or Tensor with .shape attribute
+    """
+    if isinstance(input_shape, (tuple, list)):
+        return tuple(int(x) for x in input_shape)
+    # try to extract from tensor/keras tensor
+    shp = None
+    try:
+        shp = getattr(input_shape, 'shape', None)
+    except Exception:
+        shp = None
+    if shp is None:
+        raise ValueError(f'Unsupported input_shape: {input_shape}')
+    # shp may be a TensorShape; convert to list and drop batch dim if present
+    try:
+        dims = list(shp)
+        # drop leading batch dim if present (None)
+        if len(dims) >= 2:
+            if dims[0] is None:
+                dims = dims[1:]
+        # convert dims to int or None
+        out = tuple(None if d is None else int(d) for d in dims)
+        return out
+    except Exception as e:
+        raise ValueError(f'Could not normalize input_shape={input_shape}: {e}')
+
+
 def build_lstm_model(input_shape):
+    # normalize shape and use Input layer to avoid passing KerasTensor as input_shape
+    shape = _normalize_input_shape(input_shape)
     model = Sequential()
-    model.add(LSTM(64, input_shape=input_shape, return_sequences=False))
+    model.add(tf.keras.Input(shape=shape))
+    model.add(LSTM(64, return_sequences=False))
     model.add(Dropout(0.2))
     model.add(Dense(32, activation='relu'))
     model.add(Dense(2))
@@ -115,8 +156,10 @@ def build_model_from_params(input_shape, params: dict):
 
     Expected params keys: units, dropout, dense_units, lr
     """
+    shape = _normalize_input_shape(input_shape)
     model = Sequential()
-    model.add(LSTM(params.get('units', 64), input_shape=input_shape, return_sequences=False))
+    model.add(tf.keras.Input(shape=shape))
+    model.add(LSTM(params.get('units', 64), return_sequences=False))
     model.add(Dropout(params.get('dropout', 0.2)))
     model.add(Dense(params.get('dense_units', 32), activation='relu'))
     model.add(Dense(2))
