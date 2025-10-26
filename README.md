@@ -63,6 +63,36 @@ Enable verbose logging (prints DEBUG and also saves to `models/<TICKER>/run.log`
 python src/predict_lstm.py --ticker AAPL --train --verbose
 ```
 
+Hyperparameter tuning (new)
+
+The script supports a simple randomized hyperparameter tuning flow for the LSTM model to quickly search a small space of architectures and learning rates. Tuning only runs when TensorFlow is available and is enabled with the `--tune` flag.
+
+- CLI example (tune then train):
+
+```bash
+python src/predict_lstm.py --ticker AAPL --train --tune --tune_trials 12 --verbose
+```
+
+- Flags:
+  - `--tune` — enable randomized hyperparameter tuning.
+  - `--tune_trials` — number of randomized trials to run (default 12).
+
+- What the tuner searches (small randomized space):
+  - LSTM units: [32, 64, 128]
+  - Dropout: [0.1, 0.2, 0.3]
+  - Dense units: [16, 32, 64]
+  - Learning rate: [1e-3, 5e-4, 1e-4]
+  - Batch size: [32, 64]
+
+- Behavior:
+  - For each trial the tuner trains a small model (short epochs + EarlyStopping) and evaluates validation loss.
+  - The best hyperparameters are saved to `models/<TICKER>/tune_best_params.joblib`.
+  - After tuning, the final model is built using the best parameters and trained for the full number of epochs you specified.
+
+- Caveats:
+  - The tuner is intentionally simple and quick (randomized trials). For more thorough tuning consider KerasTuner or Optuna.
+  - Tuning will be slower and consume more compute; decrease `--tune_trials` when testing locally or use fewer `--epochs` during tuning.
+
 Key CLI flags
 - `--ticker` (required): ticker symbol to download/train/predict for (e.g. AAPL).
 - `--train`: train a model and save artifacts to `models/<TICKER>/`.
@@ -73,6 +103,8 @@ Key CLI flags
 - `--period` (default `5y`): history period passed to `yfinance` (e.g. `1y`, `2y`, `5y`).
 - `--seq_len` (default 20): number of past days used as input to the model.
 - `--epochs`, `--batch_size`: training hyperparams (used only when TensorFlow is available).
+- `--tune`: enable hyperparameter tuning for LSTM.
+- `--tune_trials`: number of tuning trials to run when `--tune` is used.
 - `--verbose`: enable DEBUG logging and create `models/<TICKER>/run.log`.
 
 What the script saves (models/<TICKER>/)
@@ -80,6 +112,7 @@ What the script saves (models/<TICKER>/)
 - `scaler.joblib` — MinMaxScaler used to scale inputs/outputs.
 - `meta.joblib` — metadata including validation residuals (`resid_mean`, `resid_std`) and `seq_len` (TF path).
 - `rf_model.joblib` — sklearn fallback artifact (contains `model`, `scaler`, `seq_len`, and residual stats).
+- `tune_best_params.joblib` — best hyperparameters discovered during tuning (if `--tune` used).
 - `loss.png` — training & validation loss curve (TF path, if matplotlib available).
 - `val_predictions.png` — validation set actual vs predicted plot (TF or RF path if matplotlib available).
 - `prediction_plot.png` — recent days + single-step predicted next day (created when running `--predict`).
