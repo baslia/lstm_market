@@ -133,14 +133,45 @@ def train(ticker: str, period: str = '5y', seq_len: int = 20, epochs: int = 50, 
 
         out_dir = os.path.join('models', ticker)
         os.makedirs(out_dir, exist_ok=True)
-        joblib.dump({'model': model, 'scaler': scaler, 'seq_len': seq_len}, os.path.join(out_dir, 'rf_model.joblib'))
+        # compute residual statistics for CI
+        # prepare inverse-transformed validation arrays and residuals; provide safe fallbacks
+        val_actual = None
+        val_pred_inv = None
+        try:
+            val_actual = scaler.inverse_transform(y_val)
+            val_pred_inv = scaler.inverse_transform(val_pred)
+            resid = val_actual - val_pred_inv
+            resid_mean = np.mean(resid, axis=0)
+            resid_std = np.std(resid, axis=0, ddof=1)
+        except Exception:
+            logger.exception('Could not compute residual statistics for RF fallback; attempting safe fallbacks')
+            # Try to at least compute inverse transforms separately; otherwise fall back to zeros
+            try:
+                if val_actual is None:
+                    val_actual = scaler.inverse_transform(y_val)
+            except Exception:
+                val_actual = np.zeros((len(y_val), values.shape[1]))
+            try:
+                if val_pred_inv is None:
+                    val_pred_inv = scaler.inverse_transform(val_pred)
+            except Exception:
+                val_pred_inv = np.zeros_like(val_actual)
+            try:
+                resid = val_actual - val_pred_inv
+                resid_mean = np.mean(resid, axis=0)
+                resid_std = np.std(resid, axis=0, ddof=1)
+            except Exception:
+                resid_mean = np.zeros((values.shape[1],))
+                resid_std = np.zeros((values.shape[1],))
+
+        joblib.dump({'model': model, 'scaler': scaler, 'seq_len': seq_len, 'resid_mean': resid_mean, 'resid_std': resid_std}, os.path.join(out_dir, 'rf_model.joblib'))
         logger.info("Saved sklearn fallback model to %s", out_dir)
 
         # Plot validation predictions vs actual (if matplotlib available)
         if _HAS_MATPLOTLIB:
             try:
-                actual = scaler.inverse_transform(y_val)
-                pred = scaler.inverse_transform(val_pred)
+                actual = val_actual
+                pred = val_pred_inv
                 dates = pd.RangeIndex(start=0, stop=len(actual))
 
                 plt.figure(figsize=(10, 6))
@@ -177,6 +208,20 @@ def train(ticker: str, period: str = '5y', seq_len: int = 20, epochs: int = 50, 
     # save Keras model using recommended .keras extension
     model.save(os.path.join(out_dir, 'lstm_model.keras'))
     joblib.dump(scaler, os.path.join(out_dir, 'scaler.joblib'))
+
+    # compute residual statistics for CI and save to meta
+    try:
+        val_pred_scaled = model.predict(X_val)
+        val_pred = scaler.inverse_transform(val_pred_scaled)
+        val_actual = scaler.inverse_transform(y_val)
+        resid = val_actual - val_pred
+        resid_mean = np.mean(resid, axis=0)
+        resid_std = np.std(resid, axis=0, ddof=1)
+        joblib.dump({'resid_mean': resid_mean, 'resid_std': resid_std, 'seq_len': seq_len}, os.path.join(out_dir, 'meta.joblib'))
+        logger.info("Saved residual statistics to %s", os.path.join(out_dir, 'meta.joblib'))
+    except Exception:
+        logger.exception('Could not compute and save residual statistics (TF)')
+
     logger.info("Saved Keras model and scaler to %s", out_dir)
 
     # plot training loss if matplotlib available
@@ -337,6 +382,138 @@ def predict_next(ticker: str, train_if_missing: bool = False, **kwargs):
     return predict(ticker, seq_len=kwargs.get('seq_len', 20))
 
 
+def forecast(ticker: str, days: int = 5, ci: float = 0.8, period: str = '5y', seq_len: int = 20):
+    """Forecast `days` into the future using a recursive strategy and plot CI bands.
+
+    Uses saved residual std (from validation set) to compute an approximate CI assuming normal errors.
+    """
+    out_dir = os.path.join('models', ticker)
+    keras_model_path = os.path.join(out_dir, 'lstm_model.keras')
+    rf_path = os.path.join(out_dir, 'rf_model.joblib')
+    meta_path = os.path.join(out_dir, 'meta.joblib')
+
+    # load data and scaler
+    df = download_data(ticker, period=period)
+    if os.path.exists(rf_path):
+        meta = joblib.load(rf_path)
+        model = meta['model']
+        scaler = meta['scaler']
+        saved_seq_len = meta.get('seq_len', seq_len)
+        resid_std = meta.get('resid_std', None)
+    elif os.path.exists(keras_model_path) and os.path.exists(os.path.join(out_dir, 'scaler.joblib')):
+        model = tf.keras.models.load_model(keras_model_path)
+        scaler = joblib.load(os.path.join(out_dir, 'scaler.joblib'))
+        if os.path.exists(meta_path):
+            meta = joblib.load(meta_path)
+            resid_std = meta.get('resid_std', None)
+            saved_seq_len = meta.get('seq_len', seq_len)
+        else:
+            resid_std = None
+            saved_seq_len = seq_len
+    else:
+        logger.error('No model found to forecast for %s', ticker)
+        raise FileNotFoundError('No trained model found for forecasting. Run --train first')
+
+    # prepare sequence
+    scaler_local = scaler
+    values = scaler_local.transform(df.values)
+    if len(values) < saved_seq_len:
+        raise ValueError('Not enough historical data for the model seq_len')
+    seq = values[-saved_seq_len:].copy()
+
+    preds = []
+    for day in range(days):
+        if os.path.exists(rf_path):
+            # flatten and predict
+            x_in = seq.reshape(1, -1)
+            pred_scaled = model.predict(x_in)
+            # For RF, model.predict returns unscaled values (we saved scaler to inverse them below)
+            # ensure shape (1,2)
+        else:
+            pred_scaled = model.predict(seq.reshape(1, saved_seq_len, -1))
+
+        # if RF we saved predictions in original scale? In training we saved scaler, so model.predict returns scaled or unscaled?
+        # Our RF was trained on scaled targets earlier, so rf.predict returns scaled-space targets. We'll inverse-transform using scaler.
+        try:
+            pred = scaler_local.inverse_transform(pred_scaled.reshape(1, -1))[0]
+        except Exception:
+            # fallback: if model already predicts in original scale
+            pred = np.array(pred_scaled).reshape(-1)[:2]
+
+        preds.append(pred)
+
+        # append predicted scaled value to seq for next iteration
+        try:
+            pred_scaled_for_seq = scaler_local.transform(pred.reshape(1, -1))[0]
+        except Exception:
+            pred_scaled_for_seq = pred_scaled.reshape(-1)[:seq.shape[1]]
+
+        seq = np.vstack([seq[1:], pred_scaled_for_seq])
+
+    preds = np.array(preds)  # shape (days, 2)
+
+    # compute CI using resid_std (per-feature). If missing, estimate from recent historical changes
+    if resid_std is None:
+        # estimate residual std from recent returns (difference of last 30 days)
+        recent = df[['Open', 'Close']].values[-30:]
+        deltas = np.diff(recent, axis=0)
+        est_std = np.std(deltas, axis=0, ddof=1)
+        resid_std = est_std
+        logger.warning('Residual std not found in metadata; using estimated std from recent deltas: %s', resid_std)
+
+    # z for two-sided CI
+    z = abs(np.percentile(np.random.normal(size=100000), [(1+ci)/2*100]))[0]
+    # better to compute z directly using scipy or known value, but to avoid extra dep: use inverse of normal CDF approx
+    # Replace with exact value for common CI (80% -> z ~ 1.28155)
+    if abs(ci - 0.8) < 1e-6:
+        z = 1.281551565545
+
+    lower = preds - z * resid_std
+    upper = preds + z * resid_std
+
+    # prepare plot: recent history + forecast
+    if _HAS_MATPLOTLIB:
+        try:
+            recent = df[['Open', 'Close']].copy()
+            last_index = recent.index[-1]
+            future_index = [last_index + pd.Timedelta(days=i+1) for i in range(days)]
+
+            plt.figure(figsize=(10, 6))
+            # Open
+            plt.subplot(2, 1, 1)
+            plt.plot(recent.index, recent['Open'], label='Open (historical)')
+            plt.plot(future_index, preds[:, 0], marker='o', linestyle='--', label='Predicted Open')
+            plt.fill_between(future_index, lower[:, 0], upper[:, 0], color='C0', alpha=0.2, label=f'{int(ci*100)}% CI')
+            plt.legend(); plt.title(f'{ticker} - Forecast Open ({days} days)')
+
+            # Close
+            plt.subplot(2, 1, 2)
+            plt.plot(recent.index, recent['Close'], label='Close (historical)')
+            plt.plot(future_index, preds[:, 1], marker='o', linestyle='--', label='Predicted Close')
+            plt.fill_between(future_index, lower[:, 1], upper[:, 1], color='C1', alpha=0.2, label=f'{int(ci*100)}% CI')
+            plt.legend(); plt.title(f'{ticker} - Forecast Close ({days} days)')
+
+            plt.tight_layout()
+            plt.savefig(os.path.join(out_dir, 'forecast_plot.png'))
+            plt.close()
+            logger.info('Saved forecast plot to %s', os.path.join(out_dir, 'forecast_plot.png'))
+        except Exception:
+            logger.exception('Could not create forecast plot')
+
+    # return structured forecast
+    out = []
+    for i in range(days):
+        out.append({'date': str((df.index[-1] + pd.Timedelta(days=i+1)).date()),
+                    'open': float(preds[i, 0]),
+                    'open_lower': float(lower[i, 0]),
+                    'open_upper': float(upper[i, 0]),
+                    'close': float(preds[i, 1]),
+                    'close_lower': float(lower[i, 1]),
+                    'close_upper': float(upper[i, 1])})
+
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--ticker', required=True)
@@ -346,6 +523,9 @@ def main():
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--train', action='store_true')
     parser.add_argument('--predict', action='store_true')
+    parser.add_argument('--forecast', action='store_true', help='Forecast N days into the future and save plot')
+    parser.add_argument('--forecast_days', type=int, default=5, help='Number of days to forecast')
+    parser.add_argument('--ci', type=float, default=0.8, help='Confidence level for forecast intervals (0-1)')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose (DEBUG) logging')
     args = parser.parse_args()
 
@@ -356,6 +536,9 @@ def main():
         train(args.ticker, period=args.period, seq_len=args.seq_len, epochs=args.epochs, batch_size=args.batch_size)
     if args.predict:
         predict(args.ticker, period=args.period, seq_len=args.seq_len)
+    if args.forecast:
+        fc = forecast(args.ticker, days=args.forecast_days, ci=args.ci, period=args.period, seq_len=args.seq_len)
+        logger.info('Forecast results: %s', fc)
 
 
 if __name__ == '__main__':
