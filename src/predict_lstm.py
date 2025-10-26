@@ -474,7 +474,11 @@ def forecast(ticker: str, days: int = 5, ci: float = 0.8, period: str = '5y', se
     # prepare plot: recent history + forecast
     if _HAS_MATPLOTLIB:
         try:
+            # show only the last N days of historical data before the forecast to keep the plot readable
+            N = 30
             recent = df[['Open', 'Close']].copy()
+            if len(recent) > N:
+                recent = recent.tail(N)
             last_index = recent.index[-1]
             future_index = [last_index + pd.Timedelta(days=i+1) for i in range(days)]
 
