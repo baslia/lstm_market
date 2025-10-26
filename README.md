@@ -17,6 +17,7 @@ Contents
 - `src/predict_lstm.py` — Main script and library functions (train, predict, forecast, programmatic helpers).
 - `requirements.txt` — Suggested Python dependencies.
 - `models/` — Created after training; stores models, scalers, plots, and logs per ticker.
+- `tests/` — unit tests (covers small functions; TF-dependent tests are skipped when TensorFlow isn't available).
 
 Quick start
 
@@ -142,38 +143,54 @@ print(res)
 print(fc)
 ```
 
-Interpreting the forecast output
+Testing
 
-The `forecast(...)` returns a list of dictionaries, one per future day:
+This project includes a small unit test suite under the `tests/` directory. The tests cover utility functions and include a couple of TensorFlow-dependent smoke tests that will be skipped automatically if TensorFlow is not installed.
 
-{
-  'date': 'YYYY-MM-DD',
-  'open': float,            # predicted Open
-  'open_lower': float,      # lower bound of CI for Open
-  'open_upper': float,      # upper bound of CI for Open
-  'close': float,           # predicted Close
-  'close_lower': float,     # lower bound of CI for Close
-  'close_upper': float      # upper bound of CI for Close
-}
+To run the tests locally:
 
-Troubleshooting
+1. (Optional) Create and activate a virtual environment:
 
-- Missing packages errors (e.g., "No module named 'yfinance'") — install dependencies:
+```bash
+python -m venv venv
+source venv/bin/activate
+```
+
+2. Install dependencies (if you want to run TF-dependent tests, install TensorFlow in your environment; otherwise tests will skip TF parts):
 
 ```bash
 pip install -r requirements.txt
+# optionally, to run TF tests
+pip install tensorflow
 ```
 
-- If you want LSTM training/prediction, ensure `tensorflow` is installed in your environment. If not installed, the script uses a RandomForest fallback.
-- If no plots are produced, ensure `matplotlib` is installed. The script will continue to work without plotting but will log the missing plotting actions.
-- The script assumes calendar days when adding future dates. If you prefer business-day forecasting (skip weekends/holidays), I can change the forecast x-axis to use business days.
+3. Run the test suite (unittest discovery):
 
-Extending this project
+```bash
+python -m unittest discover -s tests -v
+```
 
-- Add volume and technical indicators as inputs (improves feature richness).
-- Add hyperparameter search and k-fold time-series cross-validation.
-- Replace simple CI with bootstrap-based prediction intervals or use probabilistic forecasting (e.g., Bayesian RNN, Monte Carlo dropout).
-- Add a Jupyter notebook that visualizes training, predictions and forecasts interactively.
+4. Run a single test module if you prefer:
+
+```bash
+python -m unittest tests.test_predict_lstm -v
+```
+
+Notes
+- TF-dependent tests are decorated with `@unittest.skipUnless(pl.TF_AVAILABLE, ...)` so they won't run if TensorFlow isn't installed. If you want to run those tests, install a matching `tensorflow` package for your Python environment.
+- You can also run tests with `pytest` if you prefer. Install `pytest` and run `pytest tests/`.
+
+Interpreting test results
+- All tests should pass. If TF-dependent tests are skipped, you'll see skip messages for those tests; that's expected unless TensorFlow is present.
+
+Troubleshooting
+- If tests fail due to missing packages, install the required packages (see above).
+- If tuning or model tests fail on your machine, ensure your environment has adequate memory/compute and a compatible TensorFlow wheel (GPU vs CPU). For quick checks, run with small `--tune_trials` and low `--epochs`.
+
+Extending tests
+
+- Add more unit tests under `tests/` for forecast logic, plotting (mock matplotlib), and RF fallback behavior.
+- Consider adding a CI workflow (GitHub Actions) to run tests on each push/PR; I can add that if you'd like.
 
 License
 
