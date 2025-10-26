@@ -109,7 +109,77 @@ def build_lstm_model(input_shape):
     return model
 
 
-def train(ticker: str, period: str = '5y', seq_len: int = 20, epochs: int = 50, batch_size: int = 32):
+# Helper: build model from hyperparameters
+def build_model_from_params(input_shape, params: dict):
+    """Build a Keras model from a params dict.
+
+    Expected params keys: units, dropout, dense_units, lr
+    """
+    model = Sequential()
+    model.add(LSTM(params.get('units', 64), input_shape=input_shape, return_sequences=False))
+    model.add(Dropout(params.get('dropout', 0.2)))
+    model.add(Dense(params.get('dense_units', 32), activation='relu'))
+    model.add(Dense(2))
+    opt = tf.keras.optimizers.Adam(learning_rate=params.get('lr', 1e-3))
+    model.compile(optimizer=opt, loss='mse')
+    return model
+
+
+# Helper: randomized hyperparameter tuning
+def tune_hyperparams(X_train, y_train, X_val, y_val, input_shape, max_trials: int = 12, random_seed: int = 42):
+    """Randomized search over a small hyperparameter space.
+
+    Returns best_params (dict) and best_val_loss (float).
+    """
+    rng = np.random.RandomState(random_seed)
+    # Define search space
+    space = {
+        'units': [32, 64, 128],
+        'dropout': [0.1, 0.2, 0.3],
+        'dense_units': [16, 32, 64],
+        'lr': [1e-3, 5e-4, 1e-4],
+        'batch_size': [32, 64]
+    }
+
+    tried = []
+    best_loss = float('inf')
+    best_params = None
+
+    for t in range(max_trials):
+        # sample random combination
+        params = {k: rng.choice(v) for k, v in space.items()}
+        key = tuple(sorted(params.items()))
+        if key in tried:
+            continue
+        tried.append(key)
+
+        logger.info('Tuning trial %d/%d: %s', t+1, max_trials, params)
+        try:
+            model = build_model_from_params(input_shape, params)
+            # small number of epochs for tuning
+            es = EarlyStopping(patience=4, restore_best_weights=True, verbose=0)
+            hist = model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=20, batch_size=params['batch_size'], callbacks=[es], verbose=0)
+            val_loss = float(min(hist.history.get('val_loss', [np.inf])))
+            logger.info('Trial %d val_loss=%.6f', t+1, val_loss)
+            if val_loss < best_loss:
+                best_loss = val_loss
+                best_params = params
+                logger.info('New best params: %s (val_loss=%.6f)', best_params, best_loss)
+            # clean up
+            tf.keras.backend.clear_session()
+        except Exception as e:
+            logger.exception('Tuning trial failed: %s', e)
+            # continue with next trial
+            tf.keras.backend.clear_session()
+            continue
+
+    if best_params is None:
+        # fallback to defaults
+        best_params = {'units': 64, 'dropout': 0.2, 'dense_units': 32, 'lr': 1e-3, 'batch_size': 32}
+    return best_params, best_loss
+
+
+def train(ticker: str, period: str = '5y', seq_len: int = 20, epochs: int = 50, batch_size: int = 32, tune: bool = False, tune_trials: int = 12):
     logger.info("Starting training for %s (period=%s, seq_len=%d, epochs=%d, batch_size=%d)", ticker, period, seq_len, epochs, batch_size)
     df = download_data(ticker, period=period)
     scaler = MinMaxScaler()
@@ -199,9 +269,28 @@ def train(ticker: str, period: str = '5y', seq_len: int = 20, epochs: int = 50, 
     X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.1, shuffle=False)
     logger.debug("Train/Val sizes: %d / %d", len(X_train), len(X_val))
 
-    model = build_lstm_model((seq_len, values.shape[1]))
+    # Hyperparameter tuning (optional)
+    best_params = None
+    if tune:
+        logger.info('Starting hyperparameter tuning for %s (trials=%d)', ticker, tune_trials)
+        input_shape = (seq_len, values.shape[1])
+        bp, bl = tune_hyperparams(X_train, y_train, X_val, y_val, input_shape, max_trials=tune_trials)
+        best_params = bp
+        logger.info('Hyperparameter tuning finished. Best params: %s (val_loss=%.6f)', best_params, bl)
+        # Save best params to meta
+        os.makedirs(os.path.join('models', ticker), exist_ok=True)
+        joblib.dump({'best_params': best_params}, os.path.join('models', ticker, 'tune_best_params.joblib'))
+
+    # Build final model (use best_params if present)
+    if best_params is not None:
+        model = build_model_from_params((seq_len, values.shape[1]), best_params)
+        final_batch = best_params.get('batch_size', batch_size)
+    else:
+        model = build_lstm_model((seq_len, values.shape[1]))
+        final_batch = batch_size
+
     es = EarlyStopping(patience=8, restore_best_weights=True)
-    history = model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=epochs, batch_size=batch_size, callbacks=[es])
+    history = model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=epochs, batch_size=final_batch, callbacks=[es])
 
     out_dir = os.path.join('models', ticker)
     os.makedirs(out_dir, exist_ok=True)
@@ -531,13 +620,15 @@ def main():
     parser.add_argument('--forecast_days', type=int, default=5, help='Number of days to forecast')
     parser.add_argument('--ci', type=float, default=0.8, help='Confidence level for forecast intervals (0-1)')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose (DEBUG) logging')
+    parser.add_argument('--tune', action='store_true', help='Enable hyperparameter tuning for LSTM')
+    parser.add_argument('--tune_trials', type=int, default=12, help='Number of tuning trials (default: 12)')
     args = parser.parse_args()
 
     # configure logging (creates models/<ticker>/run.log when ticker provided)
     configure_logging(args.ticker, verbose=args.verbose)
 
     if args.train:
-        train(args.ticker, period=args.period, seq_len=args.seq_len, epochs=args.epochs, batch_size=args.batch_size)
+        train(args.ticker, period=args.period, seq_len=args.seq_len, epochs=args.epochs, batch_size=args.batch_size, tune=args.tune, tune_trials=args.tune_trials)
     if args.predict:
         predict(args.ticker, period=args.period, seq_len=args.seq_len)
     if args.forecast:
