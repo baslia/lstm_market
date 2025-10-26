@@ -180,6 +180,12 @@ def tune_hyperparams(X_train, y_train, X_val, y_val, input_shape, max_trials: in
 
     Returns best_params (dict) and best_val_loss (float).
     """
+    # ensure inputs are numpy arrays with correct dtype
+    X_train = np.asarray(X_train, dtype=np.float32)
+    X_val = np.asarray(X_val, dtype=np.float32)
+    y_train = np.asarray(y_train, dtype=np.float32)
+    y_val = np.asarray(y_val, dtype=np.float32)
+
     rng = np.random.RandomState(random_seed)
     # Define search space
     space = {
@@ -203,6 +209,8 @@ def tune_hyperparams(X_train, y_train, X_val, y_val, input_shape, max_trials: in
         tried.append(key)
 
         logger.info('Tuning trial %d/%d: %s', t+1, max_trials, params)
+        # debug types
+        logger.debug('Param types: %s', {k: type(v).__name__ for k, v in params.items()})
         try:
             model = build_model_from_params(input_shape, params)
             # small number of epochs for tuning
