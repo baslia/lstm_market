@@ -96,6 +96,31 @@ def train(ticker: str, period: str = '5y', seq_len: int = 20, epochs: int = 50, 
         out_dir = os.path.join('models', ticker)
         os.makedirs(out_dir, exist_ok=True)
         joblib.dump({'model': model, 'scaler': scaler, 'seq_len': seq_len}, os.path.join(out_dir, 'rf_model.joblib'))
+
+        # Plot validation predictions vs actual (if matplotlib available)
+        if _HAS_MATPLOTLIB:
+            try:
+                actual = scaler.inverse_transform(y_val)
+                pred = scaler.inverse_transform(val_pred)
+                dates = pd.RangeIndex(start=0, stop=len(actual))
+
+                plt.figure(figsize=(10, 6))
+                plt.subplot(2, 1, 1)
+                plt.plot(dates, actual[:, 0], label='Actual Open')
+                plt.plot(dates, pred[:, 0], label='Predicted Open')
+                plt.legend(); plt.title(f'{ticker} - Validation: Open (RF fallback)')
+
+                plt.subplot(2, 1, 2)
+                plt.plot(dates, actual[:, 1], label='Actual Close')
+                plt.plot(dates, pred[:, 1], label='Predicted Close')
+                plt.legend(); plt.title(f'{ticker} - Validation: Close (RF fallback)')
+
+                plt.tight_layout()
+                plt.savefig(os.path.join(out_dir, 'val_predictions.png'))
+                plt.close()
+            except Exception as e:
+                print('Could not create validation plot (RF fallback):', e)
+
         print(f"Saved sklearn fallback model to {out_dir}")
         return
 
@@ -108,17 +133,46 @@ def train(ticker: str, period: str = '5y', seq_len: int = 20, epochs: int = 50, 
 
     out_dir = os.path.join('models', ticker)
     os.makedirs(out_dir, exist_ok=True)
-    model.save(os.path.join(out_dir, 'lstm_model'))
+    # save Keras model using recommended .keras extension
+    model.save(os.path.join(out_dir, 'lstm_model.keras'))
     joblib.dump(scaler, os.path.join(out_dir, 'scaler.joblib'))
 
     # plot training loss if matplotlib available
     if _HAS_MATPLOTLIB:
-        plt.figure()
-        plt.plot(history.history['loss'], label='train')
-        plt.plot(history.history['val_loss'], label='val')
-        plt.legend()
-        plt.title(f'Training loss for {ticker}')
-        plt.savefig(os.path.join(out_dir, 'loss.png'))
+        try:
+            plt.figure()
+            plt.plot(history.history['loss'], label='train')
+            plt.plot(history.history['val_loss'], label='val')
+            plt.legend()
+            plt.title(f'Training loss for {ticker}')
+            plt.savefig(os.path.join(out_dir, 'loss.png'))
+            plt.close()
+        except Exception as e:
+            print('Could not save training loss plot:', e)
+
+        # Additionally, create validation predictions vs actual plot
+        try:
+            val_pred_scaled = model.predict(X_val)
+            val_pred = scaler.inverse_transform(val_pred_scaled)
+            val_actual = scaler.inverse_transform(y_val)
+            dates = pd.RangeIndex(start=0, stop=len(val_actual))
+
+            plt.figure(figsize=(10, 6))
+            plt.subplot(2, 1, 1)
+            plt.plot(dates, val_actual[:, 0], label='Actual Open')
+            plt.plot(dates, val_pred[:, 0], label='Predicted Open')
+            plt.legend(); plt.title(f'{ticker} - Validation: Open')
+
+            plt.subplot(2, 1, 2)
+            plt.plot(dates, val_actual[:, 1], label='Actual Close')
+            plt.plot(dates, val_pred[:, 1], label='Predicted Close')
+            plt.legend(); plt.title(f'{ticker} - Validation: Close')
+
+            plt.tight_layout()
+            plt.savefig(os.path.join(out_dir, 'val_predictions.png'))
+            plt.close()
+        except Exception as e:
+            print('Could not create validation predictions plot (TF):', e)
 
     print(f"Saved model and scaler to {out_dir}")
 
@@ -126,7 +180,7 @@ def train(ticker: str, period: str = '5y', seq_len: int = 20, epochs: int = 50, 
 def predict(ticker: str, period: str = '5y', seq_len: int = 20):
     out_dir = os.path.join('models', ticker)
     # check for tensorflow model first
-    model_path = os.path.join(out_dir, 'lstm_model')
+    model_path = os.path.join(out_dir, 'lstm_model.keras')
     scaler_path = os.path.join(out_dir, 'scaler.joblib')
 
     # if TF model exists, use it
@@ -143,6 +197,27 @@ def predict(ticker: str, period: str = '5y', seq_len: int = 20):
         pred_open, pred_close = pred[0]
         last_date = df.index[-1]
         next_date = last_date + pd.Timedelta(days=1)
+
+        # create visualization: last seq actuals and predicted next-day
+        if _HAS_MATPLOTLIB:
+            try:
+                recent = df[-seq_len:][['Open', 'Close']].copy()
+                plot_df = recent.copy()
+                plot_df.loc[next_date] = [pred_open, pred_close]
+
+                plt.figure(figsize=(8, 5))
+                plt.plot(plot_df.index, plot_df['Open'], marker='o', label='Open')
+                plt.plot(plot_df.index, plot_df['Close'], marker='o', label='Close')
+                plt.scatter([next_date], [pred_open], color='C0', s=100, marker='X')
+                plt.scatter([next_date], [pred_close], color='C1', s=100, marker='X')
+                plt.legend(); plt.title(f'{ticker} - Recent Open/Close and Predicted Next Day')
+                plt.xticks(rotation=45)
+                plt.tight_layout()
+                plt.savefig(os.path.join(out_dir, 'prediction_plot.png'))
+                plt.close()
+            except Exception as e:
+                print('Could not create prediction plot (TF):', e)
+
         print(f"TF Prediction for {ticker} on {next_date.date()}: Open={pred_open:.2f}, Close={pred_close:.2f}")
         return {'date': str(next_date.date()), 'open': float(pred_open), 'close': float(pred_close)}
 
@@ -163,6 +238,26 @@ def predict(ticker: str, period: str = '5y', seq_len: int = 20):
         pred_open, pred_close = pred[0]
         last_date = df.index[-1]
         next_date = last_date + pd.Timedelta(days=1)
+
+        if _HAS_MATPLOTLIB:
+            try:
+                recent = df[-seq_len:][['Open', 'Close']].copy()
+                plot_df = recent.copy()
+                plot_df.loc[next_date] = [pred_open, pred_close]
+
+                plt.figure(figsize=(8, 5))
+                plt.plot(plot_df.index, plot_df['Open'], marker='o', label='Open')
+                plt.plot(plot_df.index, plot_df['Close'], marker='o', label='Close')
+                plt.scatter([next_date], [pred_open], color='C0', s=100, marker='X')
+                plt.scatter([next_date], [pred_close], color='C1', s=100, marker='X')
+                plt.legend(); plt.title(f'{ticker} - Recent Open/Close and Predicted Next Day (RF)')
+                plt.xticks(rotation=45)
+                plt.tight_layout()
+                plt.savefig(os.path.join(out_dir, 'prediction_plot.png'))
+                plt.close()
+            except Exception as e:
+                print('Could not create prediction plot (RF):', e)
+
         print(f"RF Fallback Prediction for {ticker} on {next_date.date()}: Open={pred_open:.2f}, Close={pred_close:.2f}")
         return {'date': str(next_date.date()), 'open': float(pred_open), 'close': float(pred_close)}
 
