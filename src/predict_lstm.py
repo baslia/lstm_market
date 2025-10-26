@@ -15,6 +15,7 @@ for convenience and does not use an LSTM.
 import argparse
 import os
 import joblib
+import logging
 
 import numpy as np
 import pandas as pd
@@ -43,13 +44,46 @@ except Exception:
 from sklearn.ensemble import RandomForestRegressor
 
 
+# module-level logger
+logger = logging.getLogger(__name__)
+
+
+def configure_logging(ticker: str | None = None, verbose: bool = False):
+    """Configure logging to console and optional per-ticker log file.
+
+    If `ticker` is provided, a file `models/<ticker>/run.log` will be created and used.
+    """
+    level = logging.DEBUG if verbose else logging.INFO
+    # reset root logger handlers to avoid duplicate logs on repeated calls
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        root.removeHandler(h)
+    root.setLevel(level)
+
+    fmt = logging.Formatter('%(asctime)s %(levelname)s %(name)s - %(message)s')
+    ch = logging.StreamHandler()
+    ch.setLevel(level)
+    ch.setFormatter(fmt)
+    root.addHandler(ch)
+
+    if ticker:
+        out_dir = os.path.join('models', ticker)
+        os.makedirs(out_dir, exist_ok=True)
+        fh = logging.FileHandler(os.path.join(out_dir, 'run.log'))
+        fh.setLevel(level)
+        fh.setFormatter(fmt)
+        root.addHandler(fh)
+
+
 def download_data(ticker: str, period: str = "5y") -> pd.DataFrame:
     """Download historical data (Open, Close) for `ticker` from Yahoo Finance."""
-    print(f"Downloading {ticker} data for period={period}...")
+    logger.info("Downloading %s data for period=%s", ticker, period)
     df = yf.download(ticker, period=period, auto_adjust=True)
     if df.empty:
+        logger.error("No data downloaded for ticker %s", ticker)
         raise ValueError(f"No data downloaded for ticker {ticker}")
     df = df[['Open', 'Close']].dropna()
+    logger.debug("Downloaded %d rows for %s", len(df), ticker)
     return df
 
 
@@ -76,13 +110,17 @@ def build_lstm_model(input_shape):
 
 
 def train(ticker: str, period: str = '5y', seq_len: int = 20, epochs: int = 50, batch_size: int = 32):
+    logger.info("Starting training for %s (period=%s, seq_len=%d, epochs=%d, batch_size=%d)", ticker, period, seq_len, epochs, batch_size)
     df = download_data(ticker, period=period)
     scaler = MinMaxScaler()
     values = scaler.fit_transform(df.values)
+    logger.debug("Values shape after scaling: %s", values.shape)
 
     X, y = create_sequences(values, seq_len)
+    logger.info("Created %d sequences (seq_len=%d)", len(X), seq_len)
     # If sklearn fallback, flatten sequences for non-recurrent model
     if not TF_AVAILABLE:
+        logger.info("TensorFlow not available; using sklearn RandomForest fallback for %s", ticker)
         n_samples = X.shape[0]
         X_flat = X.reshape(n_samples, -1)
         X_train, X_val, y_train, y_val = train_test_split(X_flat, y, test_size=0.1, shuffle=False)
@@ -91,11 +129,12 @@ def train(ticker: str, period: str = '5y', seq_len: int = 20, epochs: int = 50, 
         model.fit(X_train, y_train)
         val_pred = model.predict(X_val)
         val_mse = np.mean((val_pred - y_val) ** 2)
-        print(f"Fallback RandomForest validation MSE: {val_mse:.6f}")
+        logger.info("Fallback RandomForest validation MSE: %.6f", val_mse)
 
         out_dir = os.path.join('models', ticker)
         os.makedirs(out_dir, exist_ok=True)
         joblib.dump({'model': model, 'scaler': scaler, 'seq_len': seq_len}, os.path.join(out_dir, 'rf_model.joblib'))
+        logger.info("Saved sklearn fallback model to %s", out_dir)
 
         # Plot validation predictions vs actual (if matplotlib available)
         if _HAS_MATPLOTLIB:
@@ -118,14 +157,16 @@ def train(ticker: str, period: str = '5y', seq_len: int = 20, epochs: int = 50, 
                 plt.tight_layout()
                 plt.savefig(os.path.join(out_dir, 'val_predictions.png'))
                 plt.close()
-            except Exception as e:
-                print('Could not create validation plot (RF fallback):', e)
+                logger.info("Saved validation plot to %s", os.path.join(out_dir, 'val_predictions.png'))
+            except Exception:
+                logger.exception("Could not create validation plot (RF fallback)")
 
-        print(f"Saved sklearn fallback model to {out_dir}")
         return
 
     # TensorFlow LSTM path
+    logger.info("TensorFlow available; training LSTM model for %s", ticker)
     X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.1, shuffle=False)
+    logger.debug("Train/Val sizes: %d / %d", len(X_train), len(X_val))
 
     model = build_lstm_model((seq_len, values.shape[1]))
     es = EarlyStopping(patience=8, restore_best_weights=True)
@@ -136,6 +177,7 @@ def train(ticker: str, period: str = '5y', seq_len: int = 20, epochs: int = 50, 
     # save Keras model using recommended .keras extension
     model.save(os.path.join(out_dir, 'lstm_model.keras'))
     joblib.dump(scaler, os.path.join(out_dir, 'scaler.joblib'))
+    logger.info("Saved Keras model and scaler to %s", out_dir)
 
     # plot training loss if matplotlib available
     if _HAS_MATPLOTLIB:
@@ -147,8 +189,9 @@ def train(ticker: str, period: str = '5y', seq_len: int = 20, epochs: int = 50, 
             plt.title(f'Training loss for {ticker}')
             plt.savefig(os.path.join(out_dir, 'loss.png'))
             plt.close()
-        except Exception as e:
-            print('Could not save training loss plot:', e)
+            logger.info("Saved training loss plot to %s", os.path.join(out_dir, 'loss.png'))
+        except Exception:
+            logger.exception("Could not save training loss plot")
 
         # Additionally, create validation predictions vs actual plot
         try:
@@ -171,24 +214,34 @@ def train(ticker: str, period: str = '5y', seq_len: int = 20, epochs: int = 50, 
             plt.tight_layout()
             plt.savefig(os.path.join(out_dir, 'val_predictions.png'))
             plt.close()
-        except Exception as e:
-            print('Could not create validation predictions plot (TF):', e)
+            logger.info("Saved validation predictions plot to %s", os.path.join(out_dir, 'val_predictions.png'))
+        except Exception:
+            logger.exception("Could not create validation predictions plot (TF)")
 
-    print(f"Saved model and scaler to {out_dir}")
+    logger.info("Finished training for %s", ticker)
 
 
 def predict(ticker: str, period: str = '5y', seq_len: int = 20):
     out_dir = os.path.join('models', ticker)
-    # check for tensorflow model first
-    model_path = os.path.join(out_dir, 'lstm_model.keras')
+    # check for tensorflow model first (support new .keras filename and legacy directory)
+    keras_model_path = os.path.join(out_dir, 'lstm_model.keras')
+    legacy_model_path = os.path.join(out_dir, 'lstm_model')
     scaler_path = os.path.join(out_dir, 'scaler.joblib')
+    # prefer the .keras file but fall back to legacy directory if present
+    if os.path.exists(keras_model_path):
+        model_path = keras_model_path
+    else:
+        model_path = legacy_model_path
 
     # if TF model exists, use it
     if os.path.exists(model_path) and os.path.exists(scaler_path):
+        logger.info("Loading model from %s", model_path)
         df = download_data(ticker, period=period)
         scaler = joblib.load(scaler_path)
         values = scaler.transform(df.values)
+        logger.debug("Transformed values shape for prediction: %s", values.shape)
         if len(values) < seq_len:
+            logger.error('Not enough data to create a sequence')
             raise ValueError('Not enough data to create a sequence')
         last_seq = values[-seq_len:]
         model = tf.keras.models.load_model(model_path)
@@ -215,22 +268,26 @@ def predict(ticker: str, period: str = '5y', seq_len: int = 20):
                 plt.tight_layout()
                 plt.savefig(os.path.join(out_dir, 'prediction_plot.png'))
                 plt.close()
-            except Exception as e:
-                print('Could not create prediction plot (TF):', e)
+                logger.info("Saved prediction plot to %s", os.path.join(out_dir, 'prediction_plot.png'))
+            except Exception:
+                logger.exception("Could not create prediction plot (TF)")
 
-        print(f"TF Prediction for {ticker} on {next_date.date()}: Open={pred_open:.2f}, Close={pred_close:.2f}")
+        logger.info("TF Prediction for %s on %s: Open=%.2f, Close=%.2f", ticker, next_date.date(), pred_open, pred_close)
         return {'date': str(next_date.date()), 'open': float(pred_open), 'close': float(pred_close)}
 
     # else check for sklearn fallback
     rf_path = os.path.join(out_dir, 'rf_model.joblib')
     if os.path.exists(rf_path):
+        logger.info("Loading sklearn fallback model from %s", rf_path)
         df = download_data(ticker, period=period)
         meta = joblib.load(rf_path)
         model = meta['model']
         scaler = meta['scaler']
         seq_len = meta['seq_len']
         values = scaler.transform(df.values)
+        logger.debug("Transformed values shape for prediction (RF): %s", values.shape)
         if len(values) < seq_len:
+            logger.error('Not enough data to create a sequence')
             raise ValueError('Not enough data to create a sequence')
         last_seq = values[-seq_len:]
         pred_scaled = model.predict(last_seq.reshape(1, -1))
@@ -255,12 +312,14 @@ def predict(ticker: str, period: str = '5y', seq_len: int = 20):
                 plt.tight_layout()
                 plt.savefig(os.path.join(out_dir, 'prediction_plot.png'))
                 plt.close()
-            except Exception as e:
-                print('Could not create prediction plot (RF):', e)
+                logger.info("Saved prediction plot to %s", os.path.join(out_dir, 'prediction_plot.png'))
+            except Exception:
+                logger.exception("Could not create prediction plot (RF)")
 
-        print(f"RF Fallback Prediction for {ticker} on {next_date.date()}: Open={pred_open:.2f}, Close={pred_close:.2f}")
+        logger.info("RF Fallback Prediction for %s on %s: Open=%.2f, Close=%.2f", ticker, next_date.date(), pred_open, pred_close)
         return {'date': str(next_date.date()), 'open': float(pred_open), 'close': float(pred_close)}
 
+    logger.error("No trained model found for ticker %s. Run with --train first", ticker)
     raise FileNotFoundError('No trained model found for this ticker. Run with --train first')
 
 
@@ -272,7 +331,7 @@ def predict_next(ticker: str, train_if_missing: bool = False, **kwargs):
     """
     out_dir = os.path.join('models', ticker)
     if not os.path.exists(out_dir) and train_if_missing:
-        print('No model found; training a short model as requested...')
+        logger.info('No model found; training a short model as requested...')
         # quick train to produce a model
         train(ticker, epochs=5, seq_len=kwargs.get('seq_len', 20))
     return predict(ticker, seq_len=kwargs.get('seq_len', 20))
@@ -287,7 +346,11 @@ def main():
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--train', action='store_true')
     parser.add_argument('--predict', action='store_true')
+    parser.add_argument('--verbose', action='store_true', help='Enable verbose (DEBUG) logging')
     args = parser.parse_args()
+
+    # configure logging (creates models/<ticker>/run.log when ticker provided)
+    configure_logging(args.ticker, verbose=args.verbose)
 
     if args.train:
         train(args.ticker, period=args.period, seq_len=args.seq_len, epochs=args.epochs, batch_size=args.batch_size)
