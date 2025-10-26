@@ -159,11 +159,17 @@ def build_model_from_params(input_shape, params: dict):
     shape = _normalize_input_shape(input_shape)
     model = Sequential()
     model.add(tf.keras.Input(shape=shape))
-    model.add(LSTM(params.get('units', 64), return_sequences=False))
-    model.add(Dropout(params.get('dropout', 0.2)))
-    model.add(Dense(params.get('dense_units', 32), activation='relu'))
+    # ensure types are native Python types (not numpy types) to avoid TF shape/type issues
+    units = int(params.get('units', 64))
+    dropout = float(params.get('dropout', 0.2))
+    dense_units = int(params.get('dense_units', 32))
+    lr = float(params.get('lr', 1e-3))
+
+    model.add(LSTM(units, return_sequences=False))
+    model.add(Dropout(dropout))
+    model.add(Dense(dense_units, activation='relu'))
     model.add(Dense(2))
-    opt = tf.keras.optimizers.Adam(learning_rate=params.get('lr', 1e-3))
+    opt = tf.keras.optimizers.Adam(learning_rate=lr)
     model.compile(optimizer=opt, loss='mse')
     return model
 
@@ -201,7 +207,7 @@ def tune_hyperparams(X_train, y_train, X_val, y_val, input_shape, max_trials: in
             model = build_model_from_params(input_shape, params)
             # small number of epochs for tuning
             es = EarlyStopping(patience=4, restore_best_weights=True, verbose=0)
-            hist = model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=20, batch_size=params['batch_size'], callbacks=[es], verbose=0)
+            hist = model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=20, batch_size=int(params['batch_size']), callbacks=[es], verbose=0)
             val_loss = float(min(hist.history.get('val_loss', [np.inf])))
             logger.info('Trial %d val_loss=%.6f', t+1, val_loss)
             if val_loss < best_loss:
@@ -327,7 +333,7 @@ def train(ticker: str, period: str = '5y', seq_len: int = 20, epochs: int = 50, 
     # Build final model (use best_params if present)
     if best_params is not None:
         model = build_model_from_params((seq_len, values.shape[1]), best_params)
-        final_batch = best_params.get('batch_size', batch_size)
+        final_batch = int(best_params.get('batch_size', batch_size))
     else:
         model = build_lstm_model((seq_len, values.shape[1]))
         final_batch = batch_size
